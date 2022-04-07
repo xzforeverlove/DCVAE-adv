@@ -1,0 +1,325 @@
+import tensorflow as tf
+import tensorflow.keras.datasets.mnist as minst
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import warnings
+from tensorflow.keras import layers
+from tensorflow.keras.models import Model
+warnings.filterwarnings('ignore')
+tf.test.is_gpu_available()
+
+(train_image, train_label_or), (test_image, test_label_or) = minst.load_data()
+
+train_label = np.eye(10)[train_label_or].astype(np.float32)
+test_label = np.eye(10)[test_label_or].astype(np.float32)
+
+train_image = tf.cast(train_image,tf.float32)
+
+train_image = train_image/255.0
+images_count = train_image.shape[0]
+
+train_image = np.expand_dims(train_image, -1)
+test_image = np.expand_dims(test_image, -1)
+
+BATCH_SIZE = 256
+
+ts_train_images = tf.data.Dataset.from_tensor_slices(train_image)
+ts_train_labels = tf.data.Dataset.from_tensor_slices(train_label)
+ts_train_set = tf.data.Dataset.zip((ts_train_images,ts_train_labels))
+
+train_dataset = ts_train_set.shuffle(images_count).batch(BATCH_SIZE)
+
+def encoder():
+    encoder_input = layers.Input(shape = (28,28,1))
+    
+    y = layers.Conv2D(16,[2,2],strides = 2,padding = "valid",use_bias = False)(encoder_input)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("tanh")(y)
+    
+    y = layers.Conv2D(32,[2,2],strides = 2,padding = "valid",use_bias = False)(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("tanh")(y)
+    
+    y = layers.Conv2D(64,[2,2],strides = 2,padding = "same",use_bias = False)(y)
+    y = layers.BatchNormalization()()
+    y = layers.Activation("tanh")(y)
+    y = layers.Flatten()(y)
+    
+    y = layers.Dense(512)(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.LeakyReLU()(y)
+    
+    #均值
+    mu = layers.Dense(10)(y)
+    #方差
+    std = layers.Dense(10)(y)
+    
+    encoder_model = Model(inputs = encoder_input,outputs = [mu,std])
+    encoder_model.summary()
+    return encoder_model
+Encoder = encoder()
+
+def repeat_sample(mu,std):
+    eps = tf.random.normal(std.shape)
+    y = mu+eps*(tf.exp(std)**0.5)
+    return y
+
+def decoder():  
+    label_input = layers.Input(shape = (10,))
+    encoder_output = layers.Input(shape = (10,))
+    decoder_input = layers.Concatenate()([label_input,encoder_output])
+    
+    y = layers.Dense(128)(decoder_input)
+    y = layers.BatchNormalization()(y)
+    y = layers.LeakyReLU()(y)
+    
+    y = layers.Dense(256)(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.LeakyReLU()(y)
+    
+    y = layers.Dense(4*4*32)(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.LeakyReLU()(y)
+    y = layers.Reshape(target_shape=(4, 4, 32))(y)
+    
+    #8*8*32
+    y = layers.Conv2DTranspose(32,[3,3],strides = 2,padding = "same",use_bias = False)(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.LeakyReLU()(y)
+    
+    #7*7*64
+    y = layers.Conv2D(64,[2,2],strides = 1,padding = "valid",use_bias = False)(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.LeakyReLU()(y)
+    
+    #14*14*128
+    y = layers.Conv2DTranspose(128,[3,3],strides = 2,padding = "same",use_bias = False)(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.LeakyReLU()(y)
+    
+    """
+    28*28*1 生成的伪造样本
+    """
+    decoder_out1 = layers.Conv2DTranspose(1,[5,5],strides = 2,padding = "same",use_bias = False)(y)
+    fake_imgs = layers.BatchNormalization()(decoder_out1)
+    
+    """
+    28*28*1 生成的对抗扰动
+    """
+    imgs_per = layers.Conv2DTranspose(1,[5,5],strides = 2,padding = "same",use_bias = False)(y)
+#     imgs_per = layers.BatchNormalization()(decoder_out1)
+    
+#     decoder_out = layers.add([fake_imgs,imgs_per])
+    
+    decoder_model = Model(inputs = [label_input,encoder_output],outputs = [fake_imgs,imgs_per])
+    decoder_model.summary()
+    return decoder_model
+Decoder = decoder()
+
+def discriminator():
+    dis_input = layers.Input(shape = (28,28,1))
+    
+    x = layers.Conv2D(filters=32, kernel_size=3, strides=(2, 2))(dis_input)
+    x = layers.Activation("relu")(x)
+    
+    x = layers.Conv2D(filters=64, kernel_size=5, strides=(2, 2))(x)
+    x = layers.Activation("relu")(x)
+    
+    x = tf.keras.layers.Flatten()(x)    
+    
+    #判断真实样本，还是假样本
+    real_fake = layers.Dense(1)(x)
+    
+    #判断该样本的类别
+    img_lable = layers.Dense(10,activation = "softmax")(x)
+    
+    dis_model = Model(inputs = dis_input,outputs = [real_fake,img_lable])
+    dis_model.summary()
+    return dis_model
+Discriminator = discriminator()
+
+target_lenet = tf.keras.models.load_model("D:/model_save/LeNet.h5")
+target_alexnet = tf.keras.models.load_model("D:/model_save/AlexNet-MNIST.h5")
+target_net = target_lenet
+
+def generator():
+    z = tf.random.normal((1,10))
+    sel_index = np.random.randint(train_image.shape[0])
+    input_img = train_image[sel_index]
+    input_img = np.expand_dims(input_img,0)
+    input_label = train_label[sel_index]
+    input_label = np.expand_dims(input_label,0)
+    
+    imgs_fake,imgs_per = Decoder.predict((input_label,z))
+    perturbation = tf.clip_by_value(imgs_per,-0.1,0.1)
+    imgs_fake2 = tf.sigmoid(imgs_fake)
+    img = tf.add(perturbation,imgs_fake2)
+    img = tf.clip_by_value(img,0.0,1.0)
+    
+    p_label0 = np.argmax(target_net.predict(input_img))
+    p_label = np.argmax(target_net.predict(img))
+    plt.figure(figsize = (2,3))
+    ax1 = plt.subplot(1,2,1)
+    ax1.axis("off")
+    ax1.imshow(input_img[0],cmap = "gray")
+    ax2 = plt.subplot(1,2,2)
+    ax2.axis("off")
+    ax2.imshow(img[0],cmap = "gray")
+    print("\n原始样本lable:{}-----对抗样本lable:{}".format(p_label0,p_label))
+    plt.show()
+generator()
+
+def attack_succs(test_nums):
+    z = tf.random.normal((test_nums,10))
+    input_label = np.eye(10)[tf.random.uniform(shape=(1,test_nums),minval=0,maxval=9,dtype=tf.int32)].astype(np.float32)
+    imgs_fake,imgs_per = Decoder.predict((input_label,z))
+    perturbation = tf.clip_by_value(imgs_per,-0.1,0.1)
+    imgs_fake2 = tf.sigmoid(imgs_fake)
+    imgs = tf.add(perturbation,imgs_fake2)
+    adv_imgs = tf.clip_by_value(imgs,0.0,1.0)
+    #原始攻击
+    att_accs = 1 - target_lenet.evaluate(x = adv_imgs,y = input_label,verbose = 0)[1]
+    #迁移攻击acc
+    att_other_accs = 1 - target_alexnet.evaluate(x = adv_imgs,y = input_label,verbose = 0)[1]
+    print("原始攻击acc：{}------迁移攻击acc: {}".format(att_accs,att_other_accs))
+
+fool_loss_fun = tf.losses.CategoricalCrossentropy(from_logits=False)
+dis_loss_fun = tf.losses.BinaryCrossentropy(from_logits=False)
+optimizer_encpder = tf.keras.optimizers.Adam(1e-2)
+optimizer_decoder = tf.keras.optimizers.Adam(1e-2)
+optimizer_dis = tf.keras.optimizers.Adam(1e-2)
+
+res_trains_loss = tf.keras.metrics.Mean("res_trains_loss")
+dis_trains_loss = tf.keras.metrics.Mean("dis_trains_loss")
+fool_trains_loss = tf.keras.metrics.Mean("fool_trains_loss")
+gen_trains_loss = tf.keras.metrics.Mean("gen_trains_loss")
+dis_trains_loss = tf.keras.metrics.Mean("dis_trains_loss")
+
+box_min = 0.0
+box_max = 1.0
+
+def train_epoch(image_batch,label_batch):
+    with tf.GradientTape() as encoder_tap,tf.GradientTape() as decoder_tap,tf.GradientTape() as dis_tap:
+        encoder_out_mu,encoder_out_std = Encoder(image_batch,training=True)
+        z = repeat_sample(encoder_out_mu,encoder_out_std)
+        #输出 伪造图像 对抗扰动
+        imgs_fake,imgs_per = Decoder((label_batch,z),training=True)
+        perturbation = tf.clip_by_value(imgs_per,-0.1,0.1)
+        imgs_fake2 = tf.sigmoid(imgs_fake)
+        last_img = tf.add(perturbation,imgs_fake2)
+        #对抗样本
+        adv_imgs = tf.clip_by_value(last_img,box_mn,box_max)
+        
+        """
+        重构损失 pix_cross_entorpy
+        """
+        restructure_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels = image_batch,logits = imgs_fake)
+        restructure_loss = tf.reduce_sum(restructure_loss)/image_batch.shape[0]
+        
+        """
+        分布损失
+        """
+        distribute_loss = tf.reduce_sum(-0.5 * (encoder_out_std + 1 - encoder_out_mu**2 - tf.exp(encoder_out_std)))/image_batch.shape[0]
+        
+        """
+        愚弄损失--->无目的攻击
+        """
+        predict1 = target_net(adv_imgs,training=False)
+        fool_loss1 = fool_loss_fun(predict1,label_batch)
+        
+        predict2 = target_net(tf.sigmoid(imgs_fake),training=False)
+        fool_loss2 = fool_loss_fun(predict2,label_batch)
+        
+        k0 = 0.01
+        fool_loss = (fool_loss1*(1-k0) + fool_loss2*k0)*-5
+        
+        """
+        愚弄损失--->无目的攻击
+        """
+#         predict = target_net(tf.sigmoid(last_img),training=False)
+#         fool_loss = fool_loss_fun(predict,target_label)
+        
+        real_out,real_label = Discriminator(image_batch,training=True)
+        fake_out,fake_label = Discriminator(tf.nn.sigmoid(imgs_fake2),training=True)
+        
+        """
+        判别器的分类损失
+        """
+        ae_real_class_loss = tf.losses.CategoricalCrossentropy(from_logits=False)(label_batch,real_label)
+        ae_fake_class_loss = tf.losses.CategoricalCrossentropy(from_logits=False)(label_batch,fake_label)
+        ae_class_loss = ae_real_class_loss + ae_fake_class_loss
+        
+        
+        """
+        判别损失
+        """
+        ae_dis_loss = tf.keras.losses.BinaryCrossentropy(from_logits= True)(tf.ones_like(fake_out),fake_out)
+        
+        gan_dis_real_loss = tf.keras.losses.BinaryCrossentropy(from_logits= True)(tf.ones_like(real_out),real_out)
+        gan_dis_fake_loss = tf.keras.losses.BinaryCrossentropy(from_logits= True)(tf.zeros_like(fake_out),fake_out)
+        
+        """
+        编码器总体损失
+        """
+        encoder_loss = distribute_loss + restructure_loss*0.2
+        
+        """
+        解码器总体损失
+        """
+        k1 = 0.2
+        k2 = 0.05
+        k3 = 0.7
+        decoder_loss = k1*restructure_loss +  k2*ae_class_loss + k3*fool_loss + (1-k1-k2-k3)*ae_dis_loss
+        
+        """
+        判别器
+        """
+        dis_loss = gan_dis_real_loss + gan_dis_fake_loss*0.5 + ae_class_loss*10
+        
+        
+        """
+        记录损失值
+        """
+        res_trains_loss(restructure_loss)
+        dis_trains_loss(distribute_loss)
+        fool_trains_loss(fool_loss)
+        gen_trains_loss(decoder_loss)
+        dis_trains_loss(dis_loss)
+        
+    """
+    更新模型参数
+    """
+    encoder_gard = encoder_tap.gradient(encoder_loss,Encoder.trainable_variables)
+    optimizer_encpder.apply_gradients(zip(encoder_gard,Encoder.trainable_variables))    
+    
+    decoder_grad = decoder_tap.gradient(decoder_loss,Decoder.trainable_variables)
+    optimizer_decoder.apply_gradients(zip(decder_grad,Decoder.trainable_variables))
+    
+    dis_grad = dis_tap.gradient(dis_loss,Discriminator.trainable_variables)
+    optimizer_dis.apply_gradients(zip(dis_grad,Discriminator.trainable_variables))
+
+EPOCHS = 100
+
+def train():
+    for epoch in tqdm(range(EPOCHS)):
+        for image_batch,label_batch in train_dataset:
+            print('*',end = "")
+            train_epoch(image_batch,label_batch)
+        generator()
+        print()
+        print("restructure_loss",res_trains_loss.result().numpy())
+        print("distribute_loss",dis_trains_loss.result().numpy())
+        print("fool_loss",fool_trains_loss.result().numpy())
+        print("generator_loss",gen_trains_loss.result().numpy())
+        print("discriminator_loss",dis_trains_loss.result().numpy())
+        res_trains_loss.reset_states()
+        dis_trains_loss.reset_states()
+        fool_trains_loss.reset_states()
+        gen_trains_loss.reset_states()
+        dis_trains_loss.reset_states()
+
+if __name__ == '__main__':
+	train()
+
